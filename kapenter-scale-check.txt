@@ -1,0 +1,6 @@
+#!/bin/bash
+
+while true; do
+    curl -d '{"iterator":10000}' -H "Content-Type: application/json" -X POST internal-k8s-wsi-stress-1ca258e3b9-43877434.ap-northeast-2.elb.amazonaws.com/v1/stress
+    sleep 2
+done
