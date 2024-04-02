@@ -1,0 +1,50 @@
+version: 0.2
+
+env:
+  variables:
+    AWS_DEFAULT_REGION: "ap-northeast-2"
+    AWS_ACCOUNT_ID: "654654635343"
+    IMAGE_REPO_NAME: "wsi-backend-ecr"
+phases:
+  pre_build:
+    commands:
+      - yum update -y && yum install -y wget unzip java-17-amazon-corretto-headless findutils
+      - wget http://services.gradle.org/distributions/gradle-8.6-bin.zip
+      - mkdir /usr/local/gradle
+      - unzip gradle-8.6-bin.zip -d /usr/local/gradle
+      - export GRADLE_HOME=/usr/local/gradle/gradle-8.6
+      - export PATH=$GRADLE_HOME/bin:$PATH
+      - ln -sf /usr/share/zoneinfo/Asia/Seoul /etc/localtime
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+  build:
+    commands:
+      - gradle clean build
+      - docker build -t $IMAGE_REPO_NAME .
+      - IMAGE_LATEST_VERSION=$(date +%Y%m%d%H%M%S)
+      - docker tag $IMAGE_REPO_NAME:latest $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_LATEST_VERSION
+      - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_LATEST_VERSION
+  post_build:
+    commands:
+      - IMAGE_LATEST_VERSION=$(echo $(aws ecr describe-images --repository-name $IMAGE_REPO_NAME --query 'sort_by(imageDetails,& imagePushedAt)[-1].imageTags[0]') | tr -d '"')
+      - FAMILY="wsi-backend-td"
+      - EXECUTION_ROLE_ARN="arn:aws:iam::$AWS_ACCOUNT_ID:role/ecsTaskExecutionRole"
+      - CONTAINER_NAME="wsi-container"
+      - CONTAINER_PORT="8080"
+      - CONTAINER_IMAGE="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:${IMAGE_LATEST_VERSION}"
+      - |
+        jq -n --arg AWS_DEFAULT_REGION $AWS_DEFAULT_REGION --arg FAMILY $FAMILY --arg EXECUTION_ROLE_ARN $EXECUTION_ROLE_ARN --arg CONTAINER_NAME $CONTAINER_NAME --arg CONTAINER_IMAGE $CONTAINER_IMAGE \
+          '{"family":$FAMILY,"executionRoleArn": $EXECUTION_ROLE_ARN, "networkMode": "awsvpc", "requiresCompatibilities": ["FARGATE"],"cpu": "512","memory": "2048","runtimePlatform": {"cpuArchitecture": "X86_64", "operatingSystemFamily": "LINUX"},"containerDefinitions": [{"logConfiguration": {"logDriver": "awslogs","options": {"awslogs-group": "/ecs/wsi-backend-td", "awslogs-region": $AWS_DEFAULT_REGION, "awslogs-stream-prefix": "ecs"}},"name": $CONTAINER_NAME,"image": $CONTAINER_IMAGE,"portMappings":[{"containerPort":8080,"hostPort":8080,"protocol":"tcp"}]}]}' \
+          > task-definition.json
+      - TASK_DEFINITION_JSON=$(aws ecs register-task-definition --cli-input-json file://task-definition.json)
+      - TASK_DEFINITION_ARN=$(echo $TASK_DEFINITION_JSON | jq -r '.taskDefinition .taskDefinitionArn')
+      - >
+        jq -n --arg TASK_DEFINITION_ARN $TASK_DEFINITION_ARN --arg CONTAINER_NAME $CONTAINER_NAME --arg CONTAINER_PORT $CONTAINER_PORT \
+        '{"version": 0.0, "Resources": [{"TargetService": {"Type": "AWS::ECS::Service", "Properties": {"TaskDefinition": $TASK_DEFINITION_ARN, "LoadBalancerInfo": {"ContainerName": $CONTAINER_NAME, "ContainerPort": $CONTAINER_PORT}}}}], "Hooks": []}' \
+        > appspec.json
+      - printf '[{"name":"%s","imageUri":"%s}]' $CONTAINER_NAME $CONTAINER_IMAGE > imagedefinitions.json
+      - cat appspec.json
+artifacts:
+  files:
+    - appspec.json
+    - imagedefinitions.json
+  discard-paths: yes
